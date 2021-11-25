@@ -119,8 +119,8 @@ func defaultPolyfuseGetState(f *Polyfuse) func(PolyfuseData) (bool, error) {
 		now := time.Now()
 		distance := now.Sub(data.Timestamp)
 		newReq := data.Request - (distance.Seconds() * f.reqPerSec)
-		if newReq < 0 {
-			newReq = 0
+		if newReq < 1 {
+			newReq = 1
 		}
 		newErr := (data.Error - (distance.Seconds() * f.errPerSec))
 		if newErr < 0 {
@@ -138,7 +138,7 @@ func defaultPolyfuseGetState(f *Polyfuse) func(PolyfuseData) (bool, error) {
 		}
 
 		// check error rate
-		if f.setting.ErrorRate > 0 && f.setting.ErrorRate <= int((newErr/newErr)*10000) {
+		if f.setting.ErrorRate > 0 && f.setting.ErrorRate <= int((newErr/newReq)*10000) {
 			return false, nil
 		}
 
