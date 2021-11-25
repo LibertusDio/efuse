@@ -1,6 +1,7 @@
 package efuse
 
 import (
+	"math"
 	"sync"
 	"time"
 )
@@ -14,6 +15,7 @@ type PolyfuseData struct {
 // PolyfuseSettings setting for Polyfuse
 type PolyfuseSettings struct {
 	ID             string                                         // id of the fuse
+	Rampframe      int                                            // rampup time, ignore error rate if happens recently, recommend 4s-10s, min 1s
 	Timeframe      int                                            // counting data for give timeframe, in seconds
 	MaxRequest     int                                            // max requests before tripping, <=0 means ulimited
 	MaxError       int                                            // max error before tripping, <=0 means ulimited
@@ -70,7 +72,7 @@ func (f *Polyfuse) PushState(state bool) error {
 func NewPolyfuse(setting PolyfuseSettings) EFuse {
 	var f Polyfuse
 	// init local data
-	f.data = PolyfuseData{Request: 0, Error: 0, Timestamp: time.Now()}
+	f.data = PolyfuseData{Request: 1, Error: 0, Timestamp: time.Now()}
 	// precache rate setting
 	f.reqPerSec = float64(setting.MaxRequest) / float64(setting.Timeframe)
 	f.errPerSec = float64(setting.MaxError) / float64(setting.Timeframe)
@@ -80,6 +82,9 @@ func NewPolyfuse(setting PolyfuseSettings) EFuse {
 	}
 	if setting.ErrorRate > 10000 {
 		setting.ErrorRate = 10000
+	}
+	if setting.Rampframe < 1 {
+		setting.Rampframe = 1
 	}
 
 	// using default function if not provided
@@ -138,7 +143,7 @@ func defaultPolyfuseGetState(f *Polyfuse) func(PolyfuseData) (bool, error) {
 		}
 
 		// check error rate
-		if f.setting.ErrorRate > 0 && f.setting.ErrorRate <= int((newErr/newReq)*10000) {
+		if f.setting.ErrorRate > 0 && errorShift(newErr, newReq, float64(f.setting.ErrorRate)/10000, distance.Seconds(), float64(f.setting.Rampframe)) {
 			return false, nil
 		}
 
@@ -177,4 +182,12 @@ func defaultPolyfuseUpdateData(f *Polyfuse) func(bool, PolyfuseData) (PolyfuseDa
 
 		return data, nil
 	}
+}
+
+// errorShift shifting error value to appropriate scale an compare
+func errorShift(err, req, errRate, span, ramp float64) bool {
+	currentRate := err / req
+	sigmoidRate := 1 / (1 + math.Pow(math.E, (span*12/ramp)-6))
+	normaliseRate := sigmoidRate*(1-errRate) + errRate
+	return currentRate > normaliseRate
 }
