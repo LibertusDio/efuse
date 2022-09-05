@@ -2,6 +2,7 @@ package efuse
 
 import (
 	"math"
+	"sync"
 	"time"
 )
 
@@ -14,11 +15,12 @@ type PolyfuseData struct {
 type PolifuseStore interface {
 	FetchData() (*PolyfuseData, error)
 	PushData(PolyfuseData) error
-	GetState(PolyfuseData) (bool, error)
 }
 
 type DefaultPolyfuseStore struct {
 	data *PolyfuseData
+	lock *sync.Mutex
+	sync *bool
 }
 
 func (s DefaultPolyfuseStore) FetchData() (*PolyfuseData, error) {
@@ -26,13 +28,16 @@ func (s DefaultPolyfuseStore) FetchData() (*PolyfuseData, error) {
 }
 
 func (s DefaultPolyfuseStore) PushData(d PolyfuseData) error {
+	if *s.sync && s.lock != nil {
+		s.lock.Lock()
+		defer s.lock.Unlock()
+	}
+
 	s.data.Request = d.Request
 	s.data.Error = d.Error
 	s.data.Timestamp = d.Timestamp
 	return nil
 }
-
-func (s DefaultPolyfuseStore) GetState(PolyfuseData) (bool, error) { return false, nil }
 
 // PolyfuseSettings setting for Polyfuse
 type PolyfuseSettings struct {
@@ -119,7 +124,7 @@ func NewPolyfuse(setting PolyfuseSettings) EFuse {
 	// f.data = PolyfuseData{Request: 1, Error: 0, Timestamp: time.Now()}
 
 	// store
-	f.store = DefaultPolyfuseStore{data: &PolyfuseData{Request: 1, Error: 0, Timestamp: time.Now()}}
+	f.store = DefaultPolyfuseStore{data: &PolyfuseData{Request: 1, Error: 0, Timestamp: time.Now()}, lock: nil, sync: new(bool)}
 
 	// precache rate setting
 	f.reqPerSec = float64(setting.MaxRequest) / float64(setting.Timeframe)
