@@ -2,7 +2,6 @@ package efuse
 
 import (
 	"math"
-	"sync"
 	"time"
 )
 
@@ -12,28 +11,47 @@ type PolyfuseData struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
+type PolifuseStore interface {
+	FetchData() (*PolyfuseData, error)
+	PushData(PolyfuseData) error
+	GetState(PolyfuseData) (bool, error)
+}
+
+type DefaultPolyfuseStore struct {
+	data *PolyfuseData
+}
+
+func (s DefaultPolyfuseStore) FetchData() (*PolyfuseData, error) {
+	return s.data, nil
+}
+
+func (s DefaultPolyfuseStore) PushData(d PolyfuseData) error {
+	s.data.Request = d.Request
+	s.data.Error = d.Error
+	s.data.Timestamp = d.Timestamp
+	return nil
+}
+
+func (s DefaultPolyfuseStore) GetState(PolyfuseData) (bool, error) { return false, nil }
+
 // PolyfuseSettings setting for Polyfuse
 type PolyfuseSettings struct {
-	ID             string                                         // id of the fuse
-	Rampframe      int                                            // rampup time, ignore error rate if happens recently, recommend 4s-10s, min 1s
-	Timeframe      int                                            // counting data for give timeframe, in seconds
-	MaxRequest     int                                            // max requests before tripping, <=0 means ulimited
-	MaxError       int                                            // max error before tripping, <=0 means ulimited
-	ErrorRate      int                                            // error rate before tripping, measuring in per 10000 (aka 100.00% precision), <=0 means ulimited
-	MultiLock      bool                                           // specific safe update or not, not yet support
-	FetchDataFunc  func() (PolyfuseData, error)                   // should be provided if multi-instance
-	PushDataFunc   func(PolyfuseData) error                       // should be provided if multi-instance
-	GetStateFunc   func(PolyfuseData) (bool, error)               // decision making function
-	UpdateDataFunc func(bool, PolyfuseData) (PolyfuseData, error) // data collect and stats should be here
+	ID             string                                           // id of the fuse
+	Rampframe      int                                              // rampup time, ignore error rate if happens recently, recommend 4s-10s, min 1s
+	Timeframe      int                                              // counting data for give timeframe, in seconds
+	MaxRequest     int                                              // max requests before tripping, <=0 means ulimited
+	MaxError       int                                              // max error before tripping, <=0 means ulimited
+	ErrorRate      int                                              // error rate before tripping, measuring in per 10000 (aka 100.00% precision), <=0 means ulimited
+	MultiLock      bool                                             // specific safe update or not, not yet support
+	UpdateDataFunc func(bool, *PolyfuseData) (*PolyfuseData, error) // data collect and stats should be here
 }
 
 type Polyfuse struct {
-	mutex     sync.RWMutex
 	reqPerSec float64
 	errPerSec float64
 
-	data    PolyfuseData     // store data locally
 	setting PolyfuseSettings // store settings
+	store   PolifuseStore    // store data
 }
 
 // GetID return fuse ID
@@ -42,19 +60,45 @@ func (f *Polyfuse) GetID() string { return f.setting.ID }
 // GetState return state of the fuse base on setting GetStateFunc(). If GetStateFunc() is not provided, the default function will be used
 func (f *Polyfuse) GetState() (bool, error) {
 	// get fuse data
-	data, err := f.setting.FetchDataFunc()
+	data, err := f.store.FetchData()
 	if err != nil {
 		return false, err
 	}
 
-	// return state based on GetStateFunc()
-	return f.setting.GetStateFunc(data)
+	// snap data
+	now := time.Now()
+	distance := now.Sub(data.Timestamp)
+	newReq := data.Request - (distance.Seconds() * f.reqPerSec)
+	if newReq < 1 {
+		newReq = 1
+	}
+	newErr := (data.Error - (distance.Seconds() * f.errPerSec))
+	if newErr < 0 {
+		newErr = 0
+	}
+
+	// check request limit
+	if f.setting.MaxRequest > 0 && f.setting.MaxRequest <= int(newReq) {
+		return false, nil
+	}
+
+	// check error limit
+	if f.setting.MaxError > 0 && f.setting.MaxError <= int(newErr) {
+		return false, nil
+	}
+
+	// check error rate
+	if f.setting.ErrorRate > 0 && errorShift(newErr, newReq, float64(f.setting.ErrorRate)/10000, distance.Seconds(), float64(f.setting.Rampframe)) {
+		return false, nil
+	}
+
+	return true, f.store.PushData(*data)
 }
 
 // PushState add a state data then push to storage
 func (f *Polyfuse) PushState(state bool) error {
 	// get fuse data
-	data, err := f.setting.FetchDataFunc()
+	data, err := f.store.FetchData()
 	if err != nil {
 		return err
 	}
@@ -66,13 +110,17 @@ func (f *Polyfuse) PushState(state bool) error {
 	}
 
 	// push fuse data to storage
-	return f.setting.PushDataFunc(data)
+	return f.store.PushData(*data)
 }
 
 func NewPolyfuse(setting PolyfuseSettings) EFuse {
 	var f Polyfuse
 	// init local data
-	f.data = PolyfuseData{Request: 1, Error: 0, Timestamp: time.Now()}
+	// f.data = PolyfuseData{Request: 1, Error: 0, Timestamp: time.Now()}
+
+	// store
+	f.store = DefaultPolyfuseStore{data: &PolyfuseData{Request: 1, Error: 0, Timestamp: time.Now()}}
+
 	// precache rate setting
 	f.reqPerSec = float64(setting.MaxRequest) / float64(setting.Timeframe)
 	f.errPerSec = float64(setting.MaxError) / float64(setting.Timeframe)
@@ -87,14 +135,6 @@ func NewPolyfuse(setting PolyfuseSettings) EFuse {
 		setting.Rampframe = 1
 	}
 
-	// using default function if not provided
-	if setting.FetchDataFunc == nil || setting.PushDataFunc == nil {
-		setting.FetchDataFunc = defaultPolyfuseFetchData(&f)
-		setting.PushDataFunc = defaultPolyfusePushData(&f)
-	}
-	if setting.GetStateFunc == nil {
-		setting.GetStateFunc = defaultPolyfuseGetState(&f)
-	}
 	if setting.UpdateDataFunc == nil {
 		setting.UpdateDataFunc = defaultPolyfuseUpdateData(&f)
 	}
@@ -102,63 +142,9 @@ func NewPolyfuse(setting PolyfuseSettings) EFuse {
 	return &f
 }
 
-// defaultPolyfuseFetchData default fetch data for polyfuse
-func defaultPolyfuseFetchData(f *Polyfuse) func() (PolyfuseData, error) {
-	return func() (PolyfuseData, error) {
-		return f.data, nil
-	}
-}
-
-// defaultPolyfusePushData default update data for polyfuse
-func defaultPolyfusePushData(f *Polyfuse) func(PolyfuseData) error {
-	return func(data PolyfuseData) error {
-		f.data = data
-		return nil
-	}
-}
-
-// defaultPolyfuseGetState default get state from data for polyfuse, decision making opinion should be here
-func defaultPolyfuseGetState(f *Polyfuse) func(PolyfuseData) (bool, error) {
-	return func(data PolyfuseData) (bool, error) {
-		// snap data
-		now := time.Now()
-		distance := now.Sub(data.Timestamp)
-		newReq := data.Request - (distance.Seconds() * f.reqPerSec)
-		if newReq < 1 {
-			newReq = 1
-		}
-		newErr := (data.Error - (distance.Seconds() * f.errPerSec))
-		if newErr < 0 {
-			newErr = 0
-		}
-
-		// check request limit
-		if f.setting.MaxRequest > 0 && f.setting.MaxRequest <= int(newReq) {
-			return false, nil
-		}
-
-		// check error limit
-		if f.setting.MaxError > 0 && f.setting.MaxError <= int(newErr) {
-			return false, nil
-		}
-
-		// check error rate
-		if f.setting.ErrorRate > 0 && errorShift(newErr, newReq, float64(f.setting.ErrorRate)/10000, distance.Seconds(), float64(f.setting.Rampframe)) {
-			return false, nil
-		}
-
-		// update fuse data
-		data.Error = newErr
-		data.Request = newReq
-		data.Timestamp = now
-
-		return true, f.setting.PushDataFunc(data)
-	}
-}
-
 // defaultPolyfuseUpdateData default update data, stat equation should be put here
-func defaultPolyfuseUpdateData(f *Polyfuse) func(bool, PolyfuseData) (PolyfuseData, error) {
-	return func(state bool, data PolyfuseData) (PolyfuseData, error) {
+func defaultPolyfuseUpdateData(f *Polyfuse) func(bool, *PolyfuseData) (*PolyfuseData, error) {
+	return func(state bool, data *PolyfuseData) (*PolyfuseData, error) {
 		// snap data
 		now := time.Now()
 		distance := now.Sub(data.Timestamp)
